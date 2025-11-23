@@ -11,6 +11,8 @@ import pandas as pd
 from openai import OpenAI
 from pathlib import Path
 from datetime import datetime
+from typing import List
+import traceback
 
 # Configuration
 INPUT_CSV = "datasets/arabic_tweets_cleaned.csv"
@@ -20,6 +22,10 @@ BATCH_OUTPUT_JSONL = "batches/batch_output_{batch_num}.jsonl"
 STATE_FILE = "batches/batch_state.json"
 BATCH_SIZE = 5000  # Process in smaller batches
 MODEL = "gpt-4o-mini"  # Cost-effective model for classification (0.15$ per 1M input tokens)
+MAX_RETRIES = 5  # Max retries for downloads
+RETRY_DELAY = 5  # Seconds to wait between retries
+MAX_CONCURRENT_BATCHES = 2  # Maximum number of batches processing at once
+CHECK_INTERVAL = 30  # Seconds between status checks
 
 # System prompt for classification
 SYSTEM_PROMPT = """You are an expert mental health classifier for Arabic text. 
@@ -122,9 +128,16 @@ class BatchClassifier:
             raise
     
     def check_batch_status(self, batch_id, batch_num):
-        """Check the status of a batch"""
+        """Check the status of a batch and log errors if failed"""
         try:
             batch = self.client.batches.retrieve(batch_id)
+            
+            # If failed, try to get error details
+            if batch.status == "failed" and batch.errors:
+                print(f"[Batch {batch_num}] Failure details:")
+                for error in batch.errors.data if hasattr(batch.errors, 'data') else []:
+                    print(f"  - {error}")
+            
             return batch
         except Exception as e:
             print(f"[Batch {batch_num}] Error checking status: {e}")
@@ -164,21 +177,40 @@ class BatchClassifier:
                 time.sleep(check_interval)
     
     def download_results(self, output_file_id, batch_num):
-        """Download and save the batch results"""
+        """Download and save the batch results with retry logic"""
         print(f"[Batch {batch_num}] Downloading results from {output_file_id}...")
-        try:
-            file_response = self.client.files.content(output_file_id)
-            content = file_response.text
-            
-            output_file = BATCH_OUTPUT_JSONL.format(batch_num=batch_num)
-            with open(output_file, 'w', encoding='utf-8') as f:
-                f.write(content)
-            
-            print(f"[Batch {batch_num}] Results saved to {output_file}")
+        
+        output_file = BATCH_OUTPUT_JSONL.format(batch_num=batch_num)
+        
+        # Check if file already exists
+        if os.path.exists(output_file):
+            print(f"[Batch {batch_num}] Results file already exists: {output_file}")
             return output_file
-        except Exception as e:
-            print(f"[Batch {batch_num}] Error downloading results: {e}")
-            raise
+        
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                file_response = self.client.files.content(output_file_id)
+                content = file_response.text
+                
+                # Ensure directory exists
+                os.makedirs(os.path.dirname(output_file), exist_ok=True)
+                
+                with open(output_file, 'w', encoding='utf-8') as f:
+                    f.write(content)
+                
+                print(f"[Batch {batch_num}] Results saved to {output_file}")
+                return output_file
+                
+            except Exception as e:
+                print(f"[Batch {batch_num}] Download attempt {attempt}/{MAX_RETRIES} failed: {e}")
+                
+                if attempt < MAX_RETRIES:
+                    wait_time = RETRY_DELAY * attempt  # Exponential backoff
+                    print(f"[Batch {batch_num}] Retrying in {wait_time} seconds...")
+                    time.sleep(wait_time)
+                else:
+                    print(f"[Batch {batch_num}] All download attempts failed")
+                    raise
     
     def parse_results(self, tweets_df, output_files):
         """Parse batch results from multiple output files and create classified CSV"""
@@ -282,52 +314,165 @@ class BatchClassifier:
             self.state["status"] = "in_progress"
             self.save_state()
         
-        # Process each batch
+        # Process batches with concurrency limit
+        print("\n" + "=" * 60)
+        print(f"Processing with max {MAX_CONCURRENT_BATCHES} concurrent batches")
+        print("=" * 60)
+        
         output_files = []
+        
+        # First, check status of all existing batches to get accurate state
+        print("\nChecking status of existing batches...")
         for batch_info in self.state["batches"]:
-            batch_num = batch_info["batch_num"]
-            start_idx = batch_info["start_idx"]
-            end_idx = batch_info["end_idx"]
+            if batch_info["batch_id"] and batch_info["status"] not in ["completed"]:
+                batch_num = batch_info["batch_num"]
+                try:
+                    batch = self.check_batch_status(batch_info["batch_id"], batch_num)
+                    old_status = batch_info["status"]
+                    new_status = batch.status
+                    
+                    if old_status != new_status:
+                        print(f"[Batch {batch_num}] Status updated: {old_status} -> {new_status}")
+                        batch_info["status"] = new_status
+                        
+                        if new_status == "completed":
+                            batch_info["output_file_id"] = batch.output_file_id
+                        elif new_status in ["failed", "expired", "cancelled"]:
+                            batch_info["status"] = "failed"
+                            if batch.errors:
+                                print(f"[Batch {batch_num}] Error details: {batch.errors}")
+                        
+                        self.save_state()
+                except Exception as e:
+                    print(f"[Batch {batch_num}] Could not check status: {e}")
+        
+        # Get batches that need processing
+        pending_batches = [b for b in self.state["batches"] 
+                          if b["status"] not in ["completed"]]
+        
+        # Reset failed batches for retry
+        failed_batches = [b for b in pending_batches if b["status"] == "failed"]
+        if failed_batches:
+            print(f"\nFound {len(failed_batches)} failed batches. Resetting for retry...")
+            for batch_info in failed_batches:
+                batch_info["batch_id"] = None
+                batch_info["status"] = "pending"
+                batch_info["output_file_id"] = None
+            self.save_state()
+        
+        # Check for already submitted batches that are still processing
+        already_processing = [b for b in self.state["batches"] 
+                             if b["batch_id"] and b["status"] not in ["completed", "failed", "pending"]]
+        
+        print(f"Found {len(already_processing)} batches already processing")
+        print(f"Found {len([b for b in pending_batches if not b['batch_id']])} batches pending submission")
+        
+        completed_count = len([b for b in self.state["batches"] if b["status"] == "completed"])
+        print(f"Completed: {completed_count}/{num_batches} batches")
+        
+        batch_queue = [b for b in pending_batches if not b["batch_id"]]  # Only truly new batches
+        
+        while batch_queue or any(b["status"] not in ["completed", "failed"] for b in self.state["batches"]):
+            # Count currently processing batches (any status except completed/failed)
+            processing = [b for b in self.state["batches"] 
+                         if b["batch_id"] and b["status"] not in ["completed", "failed"]]
+            processing_count = len(processing)
             
-            print("\n" + "=" * 60)
-            print(f"Processing Batch {batch_num}/{num_batches}")
-            print(f"Tweets {start_idx} to {end_idx-1} ({end_idx - start_idx} tweets)")
-            print("=" * 60)
+            # Submit new batches if under the limit
+            while processing_count < MAX_CONCURRENT_BATCHES and batch_queue:
+                batch_info = batch_queue.pop(0)
+                batch_num = batch_info["batch_num"]
+                start_idx = batch_info["start_idx"]
+                end_idx = batch_info["end_idx"]
+                
+                print(f"\n[Batch {batch_num}/{num_batches}] Submitting tweets {start_idx} to {end_idx-1}...")
+                print(f"Currently processing: {processing_count}/{MAX_CONCURRENT_BATCHES} batches")
+                
+                try:
+                    batch_file = self.create_batch_input(tweets_df, start_idx, end_idx, batch_num)
+                    input_file_id = self.upload_batch_file(batch_file, batch_num)
+                    batch_id = self.create_batch(input_file_id, batch_num)
+                    
+                    batch_info["batch_id"] = batch_id
+                    batch_info["status"] = "submitted"
+                    self.save_state()
+                    print(f"[Batch {batch_num}] ✓ Submitted successfully!")
+                    processing_count += 1
+                except Exception as e:
+                    print(f"[Batch {batch_num}] ✗ Error submitting: {e}")
+                    print(f"[Batch {batch_num}] Full error: {traceback.format_exc()}")
+                    batch_info["status"] = "failed"
+                    self.save_state()
             
-            # Skip if already completed
+            # Check status of all processing batches (not completed, not failed)
+            processing = [b for b in self.state["batches"] 
+                         if b["batch_id"] and b["status"] not in ["completed", "failed"]]
+            
+            if not processing:
+                break
+            
+            print(f"\n[Status Check] {len(processing)} batches in progress, {len(batch_queue)} waiting...")
+            time.sleep(CHECK_INTERVAL)
+            
+            for batch_info in processing:
+                batch_num = batch_info["batch_num"]
+                batch_id = batch_info["batch_id"]
+                
+                if not batch_id:
+                    continue
+                
+                try:
+                    batch = self.check_batch_status(batch_id, batch_num)
+                    status = batch.status
+                    
+                    if status == "completed":
+                        print(f"[Batch {batch_num}] ✓ Completed!")
+                        batch_info["status"] = "completed"
+                        batch_info["output_file_id"] = batch.output_file_id
+                        self.save_state()
+                    elif status in ["failed", "expired", "cancelled"]:
+                        print(f"[Batch {batch_num}] ✗ Failed with status: {status}")
+                        if batch.errors:
+                            print(f"[Batch {batch_num}] Error info: {batch.errors}")
+                        batch_info["status"] = "failed"
+                        self.save_state()
+                    else:
+                        # Any other status means still processing
+                        batch_info["status"] = status
+                        self.save_state()
+                        if hasattr(batch, 'request_counts'):
+                            counts = batch.request_counts
+                            progress = (counts.completed / counts.total * 100) if counts.total > 0 else 0
+                            print(f"[Batch {batch_num}] {status} - {progress:.1f}% ({counts.completed}/{counts.total})")
+                        else:
+                            print(f"[Batch {batch_num}] {status}")
+                except Exception as e:
+                    print(f"[Batch {batch_num}] Error checking status: {e}")
+        
+        # Download all results
+        print("\n" + "=" * 60)
+        print("Downloading results from all completed batches")
+        print("=" * 60)
+        
+        for batch_info in self.state["batches"]:
             if batch_info["status"] == "completed" and batch_info["output_file_id"]:
-                print(f"[Batch {batch_num}] Already completed, downloading results...")
-                output_file = self.download_results(batch_info["output_file_id"], batch_num)
-                output_files.append(output_file)
-                continue
-            
-            # Resume if batch exists but not completed
-            if batch_info["batch_id"] and batch_info["status"] in ["validating", "in_progress", "finalizing"]:
-                print(f"[Batch {batch_num}] Resuming existing batch: {batch_info['batch_id']}")
-                batch = self.wait_for_completion(batch_info["batch_id"], batch_num)
-                batch_info["status"] = "completed"
-                batch_info["output_file_id"] = batch.output_file_id
-                self.save_state()
-            else:
-                # Create new batch
-                batch_file = self.create_batch_input(tweets_df, start_idx, end_idx, batch_num)
-                input_file_id = self.upload_batch_file(batch_file, batch_num)
-                batch_id = self.create_batch(input_file_id, batch_num)
-                
-                batch_info["batch_id"] = batch_id
-                batch_info["status"] = "in_progress"
-                self.save_state()
-                
-                batch = self.wait_for_completion(batch_id, batch_num)
-                batch_info["status"] = "completed"
-                batch_info["output_file_id"] = batch.output_file_id
-                self.save_state()
-            
-            # Download results
-            output_file = self.download_results(batch_info["output_file_id"], batch_num)
-            output_files.append(output_file)
-            
-            print(f"[Batch {batch_num}] Complete!")
+                batch_num = batch_info["batch_num"]
+                try:
+                    output_file = self.download_results(batch_info["output_file_id"], batch_num)
+                    output_files.append(output_file)
+                    print(f"[Batch {batch_num}] ✓ Downloaded")
+                except Exception as e:
+                    print(f"[Batch {batch_num}] ✗ Download failed: {e}")
+        
+        # Report on any failed batches
+        failed = [b for b in self.state["batches"] if b["status"] == "failed"]
+        if failed:
+            print("\n" + "=" * 60)
+            print(f"WARNING: {len(failed)} batches failed")
+            print("=" * 60)
+            for b in failed:
+                print(f"Batch {b['batch_num']}: {b.get('error', 'No error details')}")
+            print("\nYou can retry failed batches by running the script again.")
         
         # Parse all results
         print("\n" + "=" * 60)
