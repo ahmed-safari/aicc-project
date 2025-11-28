@@ -47,3 +47,6 @@ notebook>=7.0.0
 
 # API Integration
 openai>=1.0.0
+
+emoji==1.7.0
+IProgress
